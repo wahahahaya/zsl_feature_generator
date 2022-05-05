@@ -1,21 +1,16 @@
-from tkinter import Variable
 from scipy import io
 from os.path import join
-import os
 import numpy as np
 from PIL import Image
 from sklearn.metrics import accuracy_score
-from numpy import genfromtxt
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
 
 import torch.optim as optim
 from torch.autograd import Variable
 
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 
 
@@ -39,6 +34,7 @@ def build_data():
 
     image_files = np.array(new_img_files)
     image_label = mat_content['labels'].astype(int).squeeze() - 1
+    feature = mat_content['features'].T
 
     # att_splits.mat
     mat_content = io.loadmat(mat_root + "/" + data_name + "/" + class_embedding + ".mat")
@@ -51,26 +47,32 @@ def build_data():
     train_img = image_files[trainvalloc]
     train_label = image_label[trainvalloc].astype(int)
     train_att = attribute[train_label]
+    train_feature = feature[trainvalloc]
 
     test_image_unseen = image_files[test_unseen_loc]
     test_label_unseen = image_label[test_unseen_loc]
     test_unseen_att = attribute[test_label_unseen]
+    test_unseen_feature = feature[test_unseen_loc]
 
     test_image_seen = image_files[test_seen_loc]
     test_label_seen = image_label[test_seen_loc]
     test_seen_att = attribute[test_label_seen]
+    test_seen_feature = feature[test_seen_loc]
 
     res = {
         'all_attribute': attribute,
         'train_image': train_img,
         'train_label': train_label,
         'train_attribute': torch.from_numpy(train_att).float(),
+        'train_feature': torch.from_numpy(train_feature).float(),
         'test_unseen_image': test_image_unseen,
         'test_unseen_label': test_label_unseen,
         'test_unseen_attribute': torch.from_numpy(test_unseen_att).float(),
+        'test_unseen_feature': torch.from_numpy(test_unseen_feature).float(),
         'test_seen_image': test_image_seen,
         'test_seen_label': test_label_seen,
-        'test_seen_attribute': torch.from_numpy(test_seen_att).float()
+        'test_seen_attribute': torch.from_numpy(test_seen_att).float(),
+        'test_seen_feature': torch.from_numpy(test_seen_feature).float()
     }
 
     return res
@@ -83,6 +85,7 @@ class Data(Dataset):
         self.image_path = data[mode + '_image']
         self.image_label = data[mode + '_label']
         self.image_attribute = data[mode + '_attribute']
+        self.feature = data[mode + '_feature']
 
     def __getitem__(self, index):
         image_path = self.image_path[index]
@@ -91,56 +94,53 @@ class Data(Dataset):
             image = self.transform(image)
         label = self.image_label[index]
         attribute = self.image_attribute[index]
+        feature = self.feature[index]
 
-        return image, label, attribute
+        return image, label, attribute, feature
 
     def __len__(self):
         return len(self.image_label)
 
 
-class Resnet101(nn.Module):
-    def __init__(self, finetune=False):
-        super(Resnet101, self).__init__()
-        resnet101 = models.resnet101(pretrained=True)
-        modules = list(resnet101.children())[:-1]
-
-        self.model = nn.Sequential(*modules)
-        if not finetune:
-            for p in self.model.parameters():
-                p.requires_grad = False
-
-    def forward(self, x):
-        return self.model(x).squeeze()
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        m.weight.data.normal_(0.0, 0.02)
+        m.bias.data.fill_(0)
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
 
 
 class Generator(nn.Module):
-    def __init__(self, z_dim, attr_dim):
+    def __init__(self):
         super(Generator, self).__init__()
-        self.model = nn.Sequential(
-            # CUB 300+312 -> 4096
-            nn.Linear(z_dim + attr_dim, 4096),
-            nn.LeakyReLU(),
-            nn.Linear(4096, 2048),
-            nn.ReLU(),
-        )
+        self.fc1 = nn.Linear(612, 4096)
+        self.fc2 = nn.Linear(4096, 2048)
+        self.lrelu = nn.LeakyReLU(0.2, True)
+        self.sigmoid = nn.Sigmoid()
+        self.apply(weights_init)
 
-    def forward(self, z):
-        return self.model(z)
+    def forward(self, z, att):
+        z = torch.cat((z, att), dim=1)
+        x = self.lrelu(self.fc1(z))
+        out = self.sigmoid(self.fc2(x))
+        return out
 
 
 class Discriminator(nn.Module):
-    def __init__(self, x_dim, attr_dim):
+    def __init__(self):
         super(Discriminator, self).__init__()
-        self.model = nn.Sequential(
-            # CUB 2048+312 -> 4096
-            nn.Linear(x_dim + attr_dim, 4096),
-            nn.LeakyReLU(),
-            nn.Linear(4096, 1),
-            nn.Sigmoid(),
-        )
+        self.fc1 = nn.Linear(2048 + 312, 1024)
+        self.fc2 = nn.Linear(1024, 1)
+        self.lrelu = nn.LeakyReLU(0.2, True)
+        self.apply(weights_init)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, att):
+        h = torch.cat((x, att), 1)
+        self.hidden = self.lrelu(self.fc1(h))
+        h = self.fc2(self.hidden)
+        return h
 
 
 class classifier(nn.Module):
@@ -151,28 +151,24 @@ class classifier(nn.Module):
 
     def forward(self, x):
         out = self.logic(self.fc(x))
-
         return out
 
 
-def cal_accuracy(feature_extract, classifier, data_loader, device, bias=None):
+def cal_accuracy(classifier, data_loader, device):
     scores = []
     labels = []
     cpu = torch.device('cpu')
 
-    for iteration, (img, label, attribute) in enumerate(data_loader):
+    for iteration, (img, label, attribute, feature) in enumerate(data_loader):
         img = img.to(device)
         # feature.shape == (B, 300)
-        feature = feature_extract(img)
+        feature = feature.to(device)
         score = classifier(feature)
         scores.append(score)
         labels.append(label)
 
     scores = torch.cat(scores, dim=0)
     labels = torch.cat(labels, dim=0)
-
-    if bias is not None:
-        scores = scores-bias
 
     _, pred = scores.max(dim=1)
     pred = pred.view(-1).to(cpu)
@@ -195,19 +191,16 @@ def generate_syn_feature(generator, classes, attribute, num, device):
     syn_feature = torch.FloatTensor(nclass*num, 2048).to(device)
     syn_label = torch.LongTensor(nclass*num).to(device)
     syn_att = torch.FloatTensor(num, 312).to(device)
+    syn_att.requires_grad_(False)
     syn_noise = torch.FloatTensor(num, 300).to(device)
-
+    syn_noise.requires_grad_(False)
     for i in range(nclass):
         iclass = classes[i]
-        iclass_att = attribute[iclass]
-
-        syn_att.copy_(torch.Tensor(np.broadcast_to(iclass_att, (num, iclass_att.shape[0]))))
+        iclass_att = torch.Tensor(attribute[iclass])
+        syn_att.copy_(iclass_att.repeat(num, 1))
         syn_noise.normal_(0, 1)
         with torch.no_grad():
-            syn_noisev = Variable(syn_noise)
-            syn_attv = Variable(syn_att)
-        z_cat = torch.cat((syn_noisev, syn_attv), dim=1)
-        fake = generator(z_cat)
+            fake = generator(syn_noise, syn_att)
         output = fake
         syn_feature.narrow(0, i*num, num).copy_(output.data.cpu())
         syn_label.narrow(0, i*num, num).fill_(iclass)
@@ -215,10 +208,30 @@ def generate_syn_feature(generator, classes, attribute, num, device):
     return syn_feature, syn_label
 
 
+def compute_gradient_penalty(D, real_data, fake_data, attribute, device):
+    alpha = torch.rand(real_data.size(0), 1).to(device)
+    alpha = alpha.expand(real_data.size())
+
+    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+    interpolates = Variable(interpolates, requires_grad=True).to(device)
+
+    disc_interpolates = D(interpolates, Variable(attribute))
+    ones = torch.ones(disc_interpolates.size()).to(device)
+    gradients = torch.autograd.grad(
+        outputs=disc_interpolates,
+        inputs=interpolates,
+        grad_outputs=ones,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    GAN_epochs = 20
-    CLS_epochs = 10
+    epochs = 500
 
     tfs = transforms.Compose([
         transforms.Resize((256, 256)),
@@ -252,107 +265,96 @@ def train():
         pin_memory=True
     )
 
-    net_feat = Resnet101().to(device)
-    net_G = Generator(300, 312).to(device)
-    net_D = Discriminator(2048, 312).to(device)
+    net_G = Generator().to(device)
+    net_D = Discriminator().to(device)
     # 2048: resnet feature; 200: cub data classes
     net_cls = classifier(2048, 200).to(device)
 
-    opt_G = optim.Adam(net_G.parameters(), lr=1e-3)
-    opt_D = optim.Adam(net_D.parameters(), lr=1e-3)
+    opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
+    opt_D = optim.Adam(net_D.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_cls = optim.Adam(net_cls.parameters(), lr=1e-3)
 
-    loss_adv = nn.BCELoss()
     loss_cls = nn.NLLLoss()
 
-    #  train generator
-    for epoch in range(GAN_epochs):
-        for iter, (image, label, attribute) in enumerate(train_loader):
-            image = image.to(device)
-            feature = net_feat(image)
-            # real_feature.shape == (B, 2048)
-            real_feature = Variable(feature.float())
-            # attribute.shape == (B, 312)
-            attribute = Variable(attribute.float()).to(device)
+    one = torch.tensor(1, dtype=torch.float)
+    mone = one * -1
+    best_gzsl_acc = 0
+    for epoch in range(epochs):
+        for iter, (image, label, attribute, feature) in enumerate(train_loader):
+            real_feature = feature.to(device)
+            attribute = attribute.to(device)
             label = label.to(device)
 
-            batch = image.shape[0]
+            batch = feature.shape[0]
 
-            # Adversarial ground truths
-            valid = Variable(torch.Tensor(batch, 1).fill_(1.0), requires_grad=False).to(device)
-            fake = Variable(torch.Tensor(batch, 1).fill_(0.0), requires_grad=False).to(device)
+            for _ in range(5):
+                net_D.zero_grad()
 
-            # sample noise as generator input
-            z_feature = Variable(torch.Tensor(np.random.normal(0, 1, (batch, 300)))).to(device)
-            z_attribute = Variable(torch.Tensor(np.random.normal(0, 1, (batch, 312)))).to(device)
-            # z_cat.shape == (B, 612)
-            z_cat = torch.cat((z_feature, z_attribute), dim=1)
+                z_feature = torch.Tensor(np.random.normal(0, 1, (batch, 300))).to(device)
+                z_feature.requires_grad_(False)
 
-            # syn_feature.shape == (B, 2048)
-            syn_feature = net_G(z_cat)
+                syn_feature = net_G(z_feature, attribute)
 
-            # real_cat.shape == (B, 2360)
-            real_cat = torch.cat((real_feature, attribute), dim=1)
-            # syn_cat.shape == (B, 2360)
-            syn_cat = torch.cat((syn_feature, attribute), dim=1)
+                L_D_fake = 10*net_D(syn_feature, attribute).mean()
+                L_D_fake.backward(one)
 
-            loss_G = loss_adv(net_D(syn_cat), valid)
+                L_D_real = 10*net_D(real_feature, attribute).mean()
+                L_D_real.backward(mone)
 
-            opt_G.zero_grad()
-            loss_G.backward()
+                gp = 10*compute_gradient_penalty(net_D, real_feature, syn_feature, attribute, device)
+                gp.backward()
+
+                L_D = L_D_fake - L_D_real + gp
+                opt_D.step()
+
+            net_G.zero_grad()
+            z_feature = torch.Tensor(np.random.normal(0, 1, (batch, 300))).to(device)
+            z_feature.requires_grad_(False)
+
+            syn_feature = net_G(z_feature, attribute)
+
+            L_G_fake = (net_D(syn_feature, attribute)).mean()
+            L_G = -10*L_G_fake
+
+            L_G.backward()
             opt_G.step()
 
-            real_loss = loss_adv(net_D(real_cat), valid)
-            fake_loss = loss_adv(net_D(syn_cat.detach()), fake)
-            loss_D = (real_loss + fake_loss) / 2
+        print("Epoch: %d/%d, G loss: %.4f, D loss: %.4f" % (
+                    epoch, epochs, L_G.item(), L_D.item()
+            ), end=" "
+        )
 
-            opt_D.zero_grad()
-            loss_D.backward()
-            opt_D.step()
+        net_G.eval()
+        # train classifier
+        res = build_data()
+        unseenclasses = np.unique(res['test_unseen_label'])
+        # unseenattribute.shape == (200, 312); 200: all classes, 312: all attrubutes
+        all_attribute = res['all_attribute']
+        # train_feature.shape == (7057, 2048)
+        train_feature = res['train_feature'].to(device)
+        train_label = torch.from_numpy(res['train_label']).to(device)
+        # syn_feature.shape == (5000, 2048)
+        # syn_label.shape == (5000)
+        syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, all_attribute, 100, device)
+        train_X = torch.cat((train_feature, syn_feature), 0)
 
-            print("Epoch: {}/{}, Batch: {}/{}, G loss: {:.4f}, D loss: {:.4f}".format(
-                    epoch, GAN_epochs, iter, len(train_loader), loss_G.item(), loss_D.item()
-                )
-            )
+        train_Y = torch.cat((train_label, syn_label), 0)
+        pred_out = net_cls(train_X)
+        loss_classifier = loss_cls(pred_out, train_Y)
+        opt_cls.zero_grad()
+        loss_classifier.backward()
+        opt_cls.step()
 
-    # train classifier
-    res = build_data()
-    unseenclasses = res['test_unseen_label']
-    # unseenattribute.shape == (200, 312); 200: all classes, 312: all attrubutes
-    unseenattribute = res['all_attribute']
-    # syn_feature.shape == (148350, 2048)
-    # syn_label.shape == (148350)
-    syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, unseenattribute, 50, device)
-
-    net_G.eval()
-    for epoch in range(CLS_epochs):
-        for iter, (image, label, attribute) in enumerate(train_loader):
-            image = image.to(device)
-            feature = net_feat(image)
-            label = label.to(device)
-            # train_X.shape == (148407, 2048)
-            train_X = torch.cat((feature, syn_feature), 0)
-            # train_Y.shape == (148407)
-            train_Y = torch.cat((label, syn_label), 0)
-
-            pred_out = net_cls(train_X)
-
-            loss = loss_cls(pred_out, train_Y)
-
-            opt_cls.zero_grad()
-            loss.backward()
-            opt_cls.step()
-
-            print("Epoch: {}/{}, Batch: {}/{}, CLS loss: {:.4f}".format(
-                    epoch, CLS_epochs, iter, len(train_loader), loss.item()
-                )
-            )
-
-    with torch.no_grad():
-        seen_acc = cal_accuracy(net_feat, net_cls, seen_loader, device)
-        unseen_acc = cal_accuracy(net_feat, net_cls, unseen_loader, device)
-    H = 2*seen_acc*unseen_acc / (seen_acc+unseen_acc)
-    print("seen: {:.4f}, unseen: {:.4f}, H: {:.4f}".format(seen_acc, unseen_acc, H))
+        with torch.no_grad():
+            seen_acc = cal_accuracy(net_cls, seen_loader, device)
+            unseen_acc = cal_accuracy(net_cls, unseen_loader, device)
+        H = 2*seen_acc*unseen_acc / (seen_acc+unseen_acc)
+        if best_gzsl_acc < H:
+            best_acc_seen, best_acc_unseen, best_gzsl_acc = seen_acc, unseen_acc, H
+        print("seen: %.4f, unseen: %.4f, H: %.4f" % (seen_acc, unseen_acc, H))
+    print('the best GZSL seen accuracy is %.4f' % best_acc_seen)
+    print('the best GZSL unseen accuracy is %.4f' % best_acc_unseen)
+    print('the best GZSL H is %.4f' % best_gzsl_acc)
 
 
 if __name__ == "__main__":
