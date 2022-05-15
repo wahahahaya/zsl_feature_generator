@@ -1,0 +1,374 @@
+from scipy import io
+from os.path import join
+import numpy as np
+from PIL import Image
+from sklearn.metrics import accuracy_score
+from sklearn import preprocessing
+import classifier_images as classifier
+
+import torch
+import torch.nn as nn
+
+import torch.optim as optim
+from torch.autograd import Variable
+
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+
+def build_data():
+    data_name = 'CUB'
+
+    mat_root = "/HDD-1_data/arlen/dataset/xlsa17/data"
+    image_root = "../../dataset/CUB/CUB_200_2011/"
+    image_embedding = "res101"
+    class_embedding = "att_splits"
+
+    # res101.mat
+    mat_content = io.loadmat(mat_root + "/" + data_name + "/" + image_embedding + ".mat")
+    img_files = mat_content['image_files'].squeeze()
+    new_img_files = []
+    for img_file in img_files:
+        img_path = img_file[0]
+        if data_name == 'CUB':
+            img_path = join(image_root, '/'.join(img_path.split('/')[7:]))
+        new_img_files.append(img_path)
+
+    image_files = np.array(new_img_files)
+    image_label = mat_content['labels'].astype(int).squeeze() - 1
+    feature = mat_content['features'].T
+
+    # att_splits.mat
+    mat_content = io.loadmat(mat_root + "/" + data_name + "/" + class_embedding + ".mat")
+    attribute = mat_content["att"].T
+
+    test_seen_loc = mat_content['test_seen_loc'].squeeze() - 1
+    test_unseen_loc = mat_content['test_unseen_loc'].squeeze() - 1
+    # train_loc = mat_content["train_loc"].squeeze() - 1
+    trainval_loc = mat_content['trainval_loc'].squeeze() - 1
+
+    scaler = preprocessing.MinMaxScaler()
+    train_img = image_files[trainval_loc]
+
+    _train_feature = scaler.fit_transform(feature[trainval_loc])
+    _test_seen_feature = scaler.transform(feature[test_seen_loc])
+    _test_unseen_feature = scaler.transform(feature[test_unseen_loc])
+    train_feature = torch.from_numpy(_train_feature).float()
+    mx = train_feature.max()
+    train_feature.mul_(1/mx)
+    train_label = torch.from_numpy(image_label[trainval_loc]).long()
+    test_unseen_feature = torch.from_numpy(_test_unseen_feature).float()
+    test_unseen_feature.mul_(1/mx)
+    test_label_unseen = torch.from_numpy(image_label[test_unseen_loc]).long()
+    test_seen_feature = torch.from_numpy(_test_seen_feature).float()
+    test_seen_feature.mul_(1/mx)
+    test_label_seen = torch.from_numpy(image_label[test_seen_loc]).long()
+
+    # train_label = torch.from_numpy(image_label[train_loc]).long()
+    train_att = torch.from_numpy(attribute[train_label]).float()
+    # train_feature = torch.from_numpy(feature[train_loc]).float()
+
+    test_image_unseen = image_files[test_unseen_loc]
+    # test_label_unseen = torch.from_numpy(image_label[test_unseen_loc]).long()
+    test_unseen_att = torch.from_numpy(attribute[test_label_unseen]).float()
+    # test_unseen_feature = torch.from_numpy(feature[test_unseen_loc]).float()
+
+    test_image_seen = image_files[test_seen_loc]
+    # test_label_seen = torch.from_numpy(image_label[test_seen_loc]).long()
+    test_seen_att = torch.from_numpy(attribute[test_label_seen]).float()
+    # test_seen_feature = torch.from_numpy(feature[test_seen_loc]).float()
+
+    res = {
+        'all_attribute': attribute,
+        'train_image': train_img,
+        'train_label': train_label,
+        'train_attribute': train_att,
+        'train_feature': train_feature,
+        'test_unseen_image': test_image_unseen,
+        'test_unseen_label': test_label_unseen,
+        'test_unseen_attribute': test_unseen_att,
+        'test_unseen_feature': test_unseen_feature,
+        'test_seen_image': test_image_seen,
+        'test_seen_label': test_label_seen,
+        'test_seen_attribute': test_seen_att,
+        'test_seen_feature': test_seen_feature
+    }
+
+    return res
+
+
+class Data(Dataset):
+    def __init__(self, transforms_=None, mode='train'):
+        self.transform = transforms_
+        data = build_data()
+        self.image_path = data[mode + '_image']
+        self.image_label = data[mode + '_label']
+        self.image_attribute = data[mode + '_attribute']
+        self.feature = data[mode + '_feature']
+
+    def __getitem__(self, index):
+        image_path = self.image_path[index]
+        image = Image.open(image_path).convert('RGB')
+        if self.transform is not None:
+            image = self.transform(image)
+        label = self.image_label[index]
+        attribute = self.image_attribute[index]
+        feature = self.feature[index]
+
+        return image, label, attribute, feature
+
+    def __len__(self):
+        return len(self.image_label)
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        m.weight.data.normal_(0.0, 0.02)
+        m.bias.data.fill_(0)
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+
+        self.fc1 = nn.Linear(2360, 1024)
+        self.fc3 = nn.Linear(1024, 600)
+        self.lrelu = nn.LeakyReLU(0.2, True)
+        self.linear_means = nn.Linear(600, 300)
+        self.linear_log_var = nn.Linear(600, 300)
+        self.apply(weights_init)
+
+    def forward(self, x, att):
+        x = torch.cat((x, att), dim=-1)
+        x = self.lrelu(self.fc1(x))
+        x = self.lrelu(self.fc3(x))
+        means = self.linear_means(x)
+        log_vars = self.linear_log_var(x)
+        return means, log_vars
+
+
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+        self.fc1 = nn.Linear(612, 1024)
+        self.fc2 = nn.Linear(1024, 2048)
+        self.lrelu = nn.LeakyReLU(0.2, True)
+        self.sigmoid = nn.Sigmoid()
+        self.apply(weights_init)
+
+    def forward(self, z, att):
+        z = torch.cat((z, att), dim=-1)
+        x = self.lrelu(self.fc1(z))
+        out = self.sigmoid(self.fc2(x))
+        return out
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.fc1 = nn.Linear(2048 + 312, 1024)
+        self.fc2 = nn.Linear(1024, 1)
+        self.lrelu = nn.LeakyReLU(0.2, True)
+        self.apply(weights_init)
+
+    def forward(self, x, att):
+        h = torch.cat((x, att), 1)
+        self.hidden = self.lrelu(self.fc1(h))
+        h = self.fc2(self.hidden)
+        return h
+
+
+def generate_syn_feature(generator, classes, attribute, num, device):
+    nclass = classes.shape[0]
+    syn_feature = torch.FloatTensor(nclass*num, 2048)
+    syn_label = torch.LongTensor(nclass*num)
+    syn_att = torch.FloatTensor(num, 312).to(device)
+    syn_noise = torch.FloatTensor(num, 300).to(device)
+
+    for i in range(nclass):
+        iclass = classes[i]
+        iclass_att = attribute[iclass]
+        syn_att.copy_(iclass_att.repeat(num, 1))
+        syn_noise.normal_(0, 1)
+        syn_noisev = Variable(syn_noise)
+        syn_attv = Variable(syn_att)
+        fake = generator(syn_noisev, syn_attv)
+
+        output = fake
+        syn_feature.narrow(0, i*num, num).copy_(output.data.cpu())
+        syn_label.narrow(0, i*num, num).fill_(iclass)
+
+    return syn_feature, syn_label
+
+
+def compute_gradient_penalty(D, real_data, fake_data, attribute, device, lambda1):
+    alpha = torch.rand(real_data.size(0), 1).to(device)
+    alpha = alpha.expand(real_data.size())
+
+    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+    interpolates = Variable(interpolates, requires_grad=True).to(device)
+
+    disc_interpolates = D(interpolates, Variable(attribute))
+    ones = torch.ones(disc_interpolates.size()).to(device)
+    gradients = torch.autograd.grad(
+        outputs=disc_interpolates,
+        inputs=interpolates,
+        grad_outputs=ones,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lambda1
+    return gradient_penalty
+
+
+def loss_fn(recon_x, x, mean, log_var):
+    BCE = torch.nn.functional.binary_cross_entropy(recon_x+1e-12, x.detach(), reduction='none')
+    BCE = BCE.sum() / x.size(0)
+    KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp()) / x.size(0)
+    return (BCE + KLD)
+
+
+def train():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    epochs = 500
+
+    tfs = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+
+    train_ds = Data(transforms_=tfs, mode='train')
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=64,
+        num_workers=23,
+        shuffle=False,
+        pin_memory=True
+    )
+
+    net_E = Encoder().to(device)
+    net_G = Generator().to(device)
+    net_D = Discriminator().to(device)
+
+    opt_E = optim.Adam(net_E.parameters(), lr=1e-3)
+    opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
+    opt_D = optim.Adam(net_D.parameters(), lr=1e-3, betas=(0.5, 0.999))
+
+    best_gzsl_acc = 0
+    one = torch.tensor(1, dtype=torch.float).to(device)
+    mone = (-1*one).to(device)
+    lambda1 = 10
+    for epoch in range(epochs):
+        for iter, (image, label, attribute, feature) in enumerate(train_loader):
+            real_feature = feature.to(device)
+            attribute = attribute.to(device)
+            label = label.to(device)
+            batch = feature.shape[0]
+
+            for p in net_D.parameters():
+                p.requires_grad = True
+
+            gp_sum = 0
+            for _ in range(5):
+                net_D.zero_grad()
+                input_resv = Variable(real_feature)
+                input_attv = Variable(attribute)
+
+                criticD_real = net_D(input_resv, input_attv)
+                criticD_real = 10*criticD_real.mean()
+                criticD_real.backward(mone)
+
+                means, log_var = net_E(input_resv, input_attv)
+                std = torch.exp(0.5 * log_var)
+                eps = torch.randn([batch, 300]).to(device)
+                eps = Variable(eps)
+                z = eps * std + means
+
+                fake = net_G(z, input_attv)
+
+                criticD_fake = net_D(fake.detach(), input_attv)
+                criticD_fake = 10*criticD_fake.mean()
+                criticD_fake.backward(one)
+
+                # gradient penalty
+                gradient_penalty = 10*compute_gradient_penalty(net_D, real_feature, fake.data, attribute, device, lambda1)
+                gp_sum += gradient_penalty.data
+                gradient_penalty.backward()
+                Wasserstein_D = criticD_real - criticD_fake
+                D_cost = criticD_fake - criticD_real + gradient_penalty  # add Y here and #add vae reconstruction loss
+                opt_D.step()
+
+            gp_sum /= (10*lambda1*5)
+            if (gp_sum > 1.05).sum() > 0:
+                lambda1 *= 1.1
+            elif (gp_sum < 1.001).sum() > 0:
+                lambda1 /= 1.1
+
+            # ############ Generator training ##############
+            # Train Generator and Decoder
+            for p in net_D.parameters():  # freeze discrimator
+                p.requires_grad = False
+
+            net_E.zero_grad()
+            net_G.zero_grad()
+            input_resv = Variable(real_feature)
+            input_attv = Variable(attribute)
+
+            means, log_var = net_E(input_resv, input_attv)
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn([batch, 300]).to(device)
+            eps = Variable(eps)
+            z = eps * std + means
+
+            fake = net_G(z, input_attv)
+
+            vae_loss_seen = loss_fn(fake, input_resv, means, log_var)
+
+            criticG_fake = net_D(fake, input_attv).mean()
+            errG = vae_loss_seen - 10*criticG_fake
+            errG.backward()
+
+            G_cost = -criticG_fake
+            opt_G.step()
+            opt_E.step()
+
+        print("Epoch: %d/%d, G loss: %.4f, D loss: %.4f, VEA loss: %.4f, Wasserstein_D: %.4f" % (
+                    epoch, epochs, G_cost.item(), D_cost.item(), vae_loss_seen.item(), Wasserstein_D
+            ), end=" "
+        )
+
+        net_G.eval()
+        # train classifier
+        res = build_data()
+        seenclasses = np.unique(res['test_seen_label'])
+        unseenclasses = np.unique(res['test_unseen_label'])
+        # unseenattribute.shape == (200, 312); 200: all classes, 312: all attrubutes
+        all_attribute = torch.from_numpy(res['all_attribute']).float()
+        # train_feature.shape == (7057, 2048)
+        train_feature = res['train_feature'].to(device)
+        train_label = res['train_label'].to(device)
+        # syn_feature.shape == (5000, 2048)
+        # syn_label.shape == (5000)
+        syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, all_attribute, 100, device)
+        train_X = torch.cat((train_feature, syn_feature.to(device)), 0)
+        train_Y = torch.cat((train_label, syn_label.to(device)), 0)
+
+        gzsl_cls = classifier.CLASSIFIER(train_X, train_Y, res['test_seen_feature'], res['test_seen_label'], res['test_unseen_feature'], res['test_unseen_label'], seenclasses, unseenclasses, 200, device, 0.001, 0.5, 25, 100, generalized=True,)
+
+        if best_gzsl_acc < gzsl_cls.H:
+            best_acc_seen, best_acc_unseen, best_gzsl_acc = gzsl_cls.acc_seen, gzsl_cls.acc_unseen, gzsl_cls.H
+        print("seen: %.4f, unseen: %.4f, H: %.4f" % (gzsl_cls.acc_seen, gzsl_cls.acc_unseen, gzsl_cls.H))
+    print('the best GZSL seen accuracy is %.4f' % best_acc_seen)
+    print('the best GZSL unseen accuracy is %.4f' % best_acc_unseen)
+    print('the best GZSL H is %.4f' % best_gzsl_acc)
+
+
+if __name__ == "__main__":
+    train()
