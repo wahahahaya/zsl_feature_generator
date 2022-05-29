@@ -1,4 +1,4 @@
-from scipy import io
+from scipy import fft, io
 from os.path import join
 import numpy as np
 from numpy import genfromtxt
@@ -135,39 +135,46 @@ class PyTMinMaxScalerVectorized(object):
 
 
 class Res101(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Res101, self).__init__()
+        if feature_shape == 2048:
+            self.num = -1
+        else:
+            self.num = -2
 
         res101 = models.resnet101(pretrained=True)
-        modules_map = list(res101.children())[:-2]
+        modules_map = list(res101.children())[:self.num]
 
         self.resnet_map = nn.Sequential(*modules_map)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.scaler = PyTMinMaxScalerVectorized()
 
-        self.filter = torch.ones((300, 2048, 1, 1))
+        self.filter = torch.ones((300, 2048, 1, 1)).cuda()
 
     def forward(self, x):
-        # feature_map.shape == (B, 2048, 8, 8)
-        feature_map = self.resnet_map(x)
-        # feature_map.shape == (B, 300, 8, 8)
-        feature_map = F.conv2d(feature_map, self.filter, stride=1, padding=0)
-        # feature_vector.shape == (B, 300)
-        feature_vector = self.avgpool(feature_map).squeeze()
-        feature_vector = self.scaler(feature_vector)
+        if self.num == -1:
+            feature_vector = self.resnet_map(x).squeeze()
+        else:
+            # feature_map.shape == (B, 2048, 8, 8)
+            feature_map = self.resnet_map(x)
+            # feature_map.shape == (B, 300, 8, 8)
+            feature_map = F.conv2d(feature_map, self.filter, stride=1, padding=0)
+            # feature_vector.shape == (B, 300)
+            feature_vector = self.avgpool(feature_map).squeeze()
+            feature_vector = self.scaler(feature_vector)
 
         return feature_vector
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Encoder, self).__init__()
 
-        self.fc1 = nn.Linear(612, 1024)
+        self.fc1 = nn.Linear(feature_shape+312, 1024)
         self.fc3 = nn.Linear(1024, 600)
         self.lrelu = nn.LeakyReLU(0.2, True)
-        self.linear_means = nn.Linear(600, 300)
-        self.linear_log_var = nn.Linear(600, 300)
+        self.linear_means = nn.Linear(600, feature_shape)
+        self.linear_log_var = nn.Linear(600, feature_shape)
         self.apply(weights_init)
 
     def forward(self, x, att):
@@ -180,10 +187,10 @@ class Encoder(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Generator, self).__init__()
-        self.fc1 = nn.Linear(612, 1024)
-        self.fc2 = nn.Linear(1024, 300)
+        self.fc1 = nn.Linear(feature_shape+312, 1024)
+        self.fc2 = nn.Linear(1024, feature_shape)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.sigmoid = nn.Sigmoid()
         self.apply(weights_init)
@@ -196,9 +203,9 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Discriminator, self).__init__()
-        self.fc1 = nn.Linear(300 + 312, 1024)
+        self.fc1 = nn.Linear(feature_shape+312, 1024)
         self.fc2 = nn.Linear(1024, 1)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.apply(weights_init)
@@ -254,13 +261,13 @@ def cal_accuracy(classifier, feature_net, data_loader, device):
     return acc
 
 
-def generate_syn_feature(generator, classes, attribute, num, device):
+def generate_syn_feature(generator, classes, attribute, num, feature_shape, device):
     nclass = classes.shape[0]
-    syn_feature = torch.FloatTensor(nclass*num, 300).to(device)
+    syn_feature = torch.FloatTensor(nclass*num, feature_shape).to(device)
     syn_label = torch.LongTensor(nclass*num).to(device)
     syn_att = torch.FloatTensor(num, 312).to(device)
     syn_att.requires_grad_(False)
-    syn_noise = torch.FloatTensor(num, 300).to(device)
+    syn_noise = torch.FloatTensor(num, feature_shape).to(device)
     syn_noise.requires_grad_(False)
     for i in range(nclass):
         iclass = classes[i]
@@ -330,31 +337,32 @@ def train():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=20,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     seen_loader = DataLoader(
         seen_ds,
-        batch_size=20,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     unseen_loader = DataLoader(
         unseen_ds,
-        batch_size=20,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
 
-    net_E = Encoder().to(device)
-    net_G = Generator().to(device)
-    net_D = Discriminator().to(device)
-    net_cls = classifier(300, 200).to(device)
-    net_F = Res101().to(device)
+    feature_shape = 2048
+    net_E = Encoder(feature_shape).to(device)
+    net_G = Generator(feature_shape).to(device)
+    net_D = Discriminator(feature_shape).to(device)
+    net_cls = classifier(feature_shape, 200).to(device)
+    net_F = Res101(feature_shape=feature_shape).to(device)
 
     opt_E = optim.Adam(net_E.parameters(), lr=1e-3)
     opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
@@ -371,7 +379,7 @@ def train():
     res = build_data()
     net_F.eval()
     for epoch in range(epochs):
-        train_feature = np.zeros((1, 300))
+        train_feature = np.zeros((1, feature_shape))
         for iter, (image, label, attribute, feature) in enumerate(train_loader):
             # real_feature = feature.to(device)
             attribute = attribute.to(device)
@@ -399,7 +407,7 @@ def train():
 
                 means, log_var = net_E(input_resv, input_attv)
                 std = torch.exp(0.5 * log_var)
-                eps = torch.randn([batch, 300]).to(device)
+                eps = torch.randn([batch, feature_shape]).to(device)
                 eps = Variable(eps)
                 z = eps * std + means
 
@@ -437,7 +445,7 @@ def train():
 
             means, log_var = net_E(input_resv, input_attv)
             std = torch.exp(0.5 * log_var)
-            eps = torch.randn([batch, 300]).to(device)
+            eps = torch.randn([batch, feature_shape]).to(device)
             eps = Variable(eps)
             z = eps * std + means
 
@@ -468,7 +476,7 @@ def train():
         train_label = torch.from_numpy(res['train_label']).to(device)
         # syn_feature.shape == (5000, 2048)
         # syn_label.shape == (5000)
-        syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, all_attribute, 100, device)
+        syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, all_attribute, 100, feature_shape, device)
         train_X = torch.cat((train_feature, syn_feature), 0)
         train_Y = torch.cat((train_label, syn_label), 0)
 
