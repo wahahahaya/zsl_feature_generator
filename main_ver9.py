@@ -138,32 +138,120 @@ class Res101(nn.Module):
     def __init__(self):
         super(Res101, self).__init__()
 
-        res101 = models.resnet101(pretrained=True)
+        res101 = models.resnet101(pretrained=False)
         modules_map = list(res101.children())[:-2]
 
         self.resnet_map = nn.Sequential(*modules_map)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.scaler = PyTMinMaxScalerVectorized()
 
-        self.filter = torch.ones((300, 2048, 1, 1))
-
     def forward(self, x):
         # feature_map.shape == (B, 2048, 8, 8)
         feature_map = self.resnet_map(x)
-        # feature_map.shape == (B, 300, 8, 8)
-        feature_map = F.conv2d(feature_map, self.filter, stride=1, padding=0)
-        # feature_vector.shape == (B, 300)
+        # feature_vector.shape == (B, 2048)
         feature_vector = self.avgpool(feature_map).squeeze()
         feature_vector = self.scaler(feature_vector)
 
-        return feature_vector
+        return feature_vector, feature_map
+
+
+class FeatureNet(nn.Module):
+    def __init__(self, res101, attrinute_map, device) -> None:
+        super(FeatureNet, self).__init__()
+
+        self.device = device
+
+        # self.attribute_map.shape == (312, 300)
+        self.attribute_map = torch.from_numpy(attrinute_map).float().to(self.device)
+        self.backbone = res101.to(self.device)
+
+        self.conv = nn.Conv2d(2048, 300, 1, 1)
+
+        self.mse_loss = nn.MSELoss()
+
+    def conv_feature(self, x):
+        # image_input.shape == (B, C, 256, 256) --> feature_map.shape == (B, 2048, 8, 8)
+        feature_vector, feature_map = self.backbone(x)
+        # feature_map.shape == (B, 300, 8, 8)
+        feature_map = self.conv(feature_map)
+        batch, channel, width, hight = feature_map.shape
+        # feature_map.shape == (B, 300, 64)
+        feature_map = feature_map.view(batch, channel, width*hight)
+
+        return feature_vector, feature_map
+
+    def attention(self, x):
+        batch, channel, length = x.shape
+        # key.shape == feature_map.shape == (B, 300, 64)
+        key = x
+        # query.shape == (312, 300)
+        query = self.attribute_map
+
+        # attention_map.shape == (B, 312, 8, 8)
+        attention_map = torch.einsum('lv,bvr->blr', query, key)
+        attention_map = F.softmax(attention_map, -1)
+        attention_map = attention_map.view(batch, -1, 8, 8)
+
+        # attention_attribute.shape == (B, 312)
+        attention_attribute = F.max_pool2d(attention_map, kernel_size=(8, 8))
+        attention_attribute = attention_attribute.view(batch, -1)
+
+        return attention_map, attention_attribute
+
+    def CPT(self, atten_map):
+        """
+        :param atten_map: N, L, W, H
+        :return:
+        """
+
+        N, L, W, H = atten_map.shape
+        xp = torch.tensor(list(range(W))).long().unsqueeze(1).to(self.device)
+        yp = torch.tensor(list(range(H))).long().unsqueeze(0).to(self.device)
+
+        xp = xp.repeat(1, H)
+        yp = yp.repeat(W, 1)
+
+        atten_map_t = atten_map.view(N, L, -1)
+        value, idx = atten_map_t.max(dim=-1)
+
+        tx = torch.div(idx, H, rounding_mode='floor')
+        ty = idx - H * tx
+
+        xp = xp.unsqueeze(0).unsqueeze(0)
+        yp = yp.unsqueeze(0).unsqueeze(0)
+        tx = tx.unsqueeze(-1).unsqueeze(-1)
+        ty = ty.unsqueeze(-1).unsqueeze(-1)
+
+        pos = (xp - tx) ** 2 + (yp - ty) ** 2
+
+        loss = atten_map * pos
+
+        loss = loss.reshape(N, -1).mean(-1)
+        loss = loss.mean()
+
+        return loss
+
+    def forward(self, x, code):
+        # feature.shape == (B, 300, 64)
+        feature_vector, feature_map = self.conv_feature(x)
+        attention_map, attention_attribute = self.attention(feature_map)
+
+        loss_mse = self.mse_loss(attention_attribute, code)
+        loss_cpt = self.CPT(attention_map)
+
+        loss_dict = {
+            'mse_loss': loss_mse,
+            'distance_loss': loss_cpt,
+        }
+
+        return loss_dict, feature_vector
 
 
 class Encoder(nn.Module):
     def __init__(self):
         super(Encoder, self).__init__()
 
-        self.fc1 = nn.Linear(612, 1024)
+        self.fc1 = nn.Linear(2360, 1024)
         self.fc3 = nn.Linear(1024, 600)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.linear_means = nn.Linear(600, 300)
@@ -183,7 +271,7 @@ class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
         self.fc1 = nn.Linear(612, 1024)
-        self.fc2 = nn.Linear(1024, 300)
+        self.fc2 = nn.Linear(1024, 2048)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.sigmoid = nn.Sigmoid()
         self.apply(weights_init)
@@ -198,7 +286,7 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
-        self.fc1 = nn.Linear(300 + 312, 1024)
+        self.fc1 = nn.Linear(2048 + 312, 1024)
         self.fc2 = nn.Linear(1024, 1)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.apply(weights_init)
@@ -230,7 +318,9 @@ def cal_accuracy(classifier, feature_net, data_loader, device):
     for iteration, (img, label, attribute, feature) in enumerate(data_loader):
         img = img.to(device)
         attribute = attribute.to(device)
-        real_feature = feature_net(img)
+        _, real_feature = feature_net(img, attribute)
+        # feature.shape == (B, 300)
+        # feature = feature.to(device)
         score = classifier(real_feature)
         scores.append(score)
         labels.append(label)
@@ -256,7 +346,7 @@ def cal_accuracy(classifier, feature_net, data_loader, device):
 
 def generate_syn_feature(generator, classes, attribute, num, device):
     nclass = classes.shape[0]
-    syn_feature = torch.FloatTensor(nclass*num, 300).to(device)
+    syn_feature = torch.FloatTensor(nclass*num, 2048).to(device)
     syn_label = torch.LongTensor(nclass*num).to(device)
     syn_att = torch.FloatTensor(num, 312).to(device)
     syn_att.requires_grad_(False)
@@ -309,14 +399,14 @@ def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 500
 
-    # # load attribute map
-    # data_set_path = '../../dataset/'
+    # load attribute map
+    data_set_path = '../../dataset/'
 
-    # glove_path = data_set_path + "glove_embedding.csv"
-    # fasttext_path = data_set_path + "fasttext_embedding.csv"
+    glove_path = data_set_path + "glove_embedding.csv"
+    fasttext_path = data_set_path + "fasttext_embedding.csv"
 
-    # glove_map = genfromtxt(glove_path, delimiter=',', skip_header=0)
-    # fasttext_map = genfromtxt(fasttext_path, delimiter=',', skip_header=0)
+    glove_map = genfromtxt(glove_path, delimiter=',', skip_header=0)
+    fasttext_map = genfromtxt(fasttext_path, delimiter=',', skip_header=0)
 
     tfs = transforms.Compose([
         transforms.Resize((256, 256)),
@@ -330,21 +420,21 @@ def train():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=20,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     seen_loader = DataLoader(
         seen_ds,
-        batch_size=20,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     unseen_loader = DataLoader(
         unseen_ds,
-        batch_size=20,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
@@ -353,13 +443,14 @@ def train():
     net_E = Encoder().to(device)
     net_G = Generator().to(device)
     net_D = Discriminator().to(device)
-    net_cls = classifier(300, 200).to(device)
-    net_F = Res101().to(device)
+    net_cls = classifier(2048, 200).to(device)
+    net_F = FeatureNet(Res101(), glove_map, device).to(device)
 
     opt_E = optim.Adam(net_E.parameters(), lr=1e-3)
     opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_D = optim.Adam(net_D.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_cls = optim.Adam(net_cls.parameters(), lr=1e-3)
+    opt_F = torch.optim.SGD(net_F.parameters(), lr=1e-3)
 
     loss_cls = nn.NLLLoss()
 
@@ -369,9 +460,8 @@ def train():
     mone = (-1*one).to(device)
     lambda1 = 10
     res = build_data()
-    net_F.eval()
     for epoch in range(epochs):
-        train_feature = np.zeros((1, 300))
+        train_feature = np.zeros((1, 2048))
         for iter, (image, label, attribute, feature) in enumerate(train_loader):
             # real_feature = feature.to(device)
             attribute = attribute.to(device)
@@ -379,7 +469,14 @@ def train():
             label = label.to(device)
             batch = feature.shape[0]
 
-            real_feature = net_F(image)
+            # real_feature.shape == (B, 2048)
+            for _ in range(5):
+                loss_dict, real_feature = net_F(image, attribute)
+                feature_loss = loss_dict['mse_loss'] + loss_dict['distance_loss']
+
+                opt_F.zero_grad()
+                feature_loss.backward()
+                opt_F.step()
 
             train_feature = np.vstack((train_feature, real_feature.cpu().detach().numpy()))
 
@@ -453,8 +550,8 @@ def train():
             opt_G.step()
             opt_E.step()
 
-        print("Epoch: %d/%d, G loss: %.4f, D loss: %.4f, VEA loss: %.4f, Wasserstein_D: %.4f" % (
-                    epoch, epochs, G_cost.item(), D_cost.item(), vae_loss_seen.item(), Wasserstein_D
+        print("Epoch: %d/%d,F loss: %.4f, G loss: %.4f, D loss: %.4f, VEA loss: %.4f, Wasserstein_D: %.4f" % (
+                    epoch, epochs, feature_loss.item(), G_cost.item(), D_cost.item(), vae_loss_seen.item(), Wasserstein_D
             ), end=" "
         )
         net_G.eval()
