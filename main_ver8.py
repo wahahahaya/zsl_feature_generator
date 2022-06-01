@@ -231,10 +231,15 @@ def cal_accuracy(classifier, feature_net, data_loader, device):
     scores = []
     labels = []
     cpu = torch.device('cpu')
+    scaler = PyTMinMaxScalerVectorized()
+    avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
     for iteration, (img, label, attribute, feature) in enumerate(data_loader):
         img = img.to(device)
-        feature = feature_net(img)
+        feature = feature_net(img) # (B, feature)
+        batch, channel, length, height = feature.shape
+        feature = avgpool(feature).view(batch, channel)  # (B, feature_shape)
+        feature = scaler(feature)
         # feature.shape == (B, 300)
         # feature = feature.to(device)
         score = classifier(feature)
@@ -312,7 +317,7 @@ def loss_fn(recon_x, x, mean, log_var):
 
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    epochs = 500
+    epochs = 2000
     feature_shape = 300
     print(feature_shape)
     # load attribute map
@@ -338,21 +343,21 @@ def train():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=32,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     seen_loader = DataLoader(
         seen_ds,
-        batch_size=32,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     unseen_loader = DataLoader(
         unseen_ds,
-        batch_size=32,
+        batch_size=64,
         num_workers=23,
         shuffle=False,
         pin_memory=True
