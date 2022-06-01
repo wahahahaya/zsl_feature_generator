@@ -1,3 +1,7 @@
+"""
+traditional zsl training, by using the feature from the res101.mat
+"""
+
 from scipy import io
 from os.path import join
 import numpy as np
@@ -56,20 +60,20 @@ def build_data():
 
     train_img = image_files[trainval_loc]
     train_feature = torch.from_numpy(_train_feature).float()
-    mx = train_feature.max()
-    train_feature.mul_(1/mx)
+    # mx = train_feature.max()
+    # train_feature.mul_(1/mx)
     train_label = image_label[trainval_loc].astype(int)
     train_att = torch.from_numpy(attribute[train_label]).float()
 
     test_image_unseen = image_files[test_unseen_loc]
     test_unseen_feature = torch.from_numpy(_test_unseen_feature).float()
-    test_unseen_feature.mul_(1/mx)
+    # test_unseen_feature.mul_(1/mx)
     test_label_unseen = image_label[test_unseen_loc].astype(int)
     test_unseen_att = torch.from_numpy(attribute[test_label_unseen]).float()
 
     test_image_seen = image_files[test_seen_loc]
     test_seen_feature = torch.from_numpy(_test_seen_feature).float()
-    test_seen_feature.mul_(1/mx)
+    # test_seen_feature.mul_(1/mx)
     test_label_seen = image_label[test_seen_loc].astype(int)
     test_seen_att = torch.from_numpy(attribute[test_label_seen]).float()
 
@@ -134,10 +138,12 @@ class Res101(nn.Module):
         modules = list(res101.children())[:-1]
 
         self.resnet = nn.Sequential(*modules)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         # out.shape == (B, 2048, W, H)
         out = self.resnet(x).squeeze()
+        out = self.sigmoid(out)
 
         return out
 
@@ -206,13 +212,14 @@ class classifier(nn.Module):
         return out
 
 
-def cal_accuracy(classifier, data_loader, device):
+def cal_accuracy(classifier, feature_net, data_loader, device):
     scores = []
     labels = []
     cpu = torch.device('cpu')
 
     for iteration, (img, label, attribute, feature) in enumerate(data_loader):
         img = img.to(device)
+        # feature = feature_net(img)
         # feature.shape == (B, 300)
         feature = feature.to(device)
         score = classifier(feature)
@@ -282,6 +289,8 @@ def compute_gradient_penalty(D, real_data, fake_data, attribute, device, lambda1
 
 
 def loss_fn(recon_x, x, mean, log_var):
+    # recon_x == fake
+    # x == real
     BCE = torch.nn.functional.binary_cross_entropy(recon_x+1e-12, x.detach(), reduction='none')
     BCE = BCE.sum() / x.size(0)
     KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp()) / x.size(0)
@@ -292,14 +301,14 @@ def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 500
 
-    # load attribute map
-    data_set_path = '../../dataset/'
+    # # load attribute map
+    # data_set_path = '../../dataset/'
 
-    glove_path = data_set_path + "glove_embedding.csv"
-    fasttext_path = data_set_path + "fasttext_embedding.csv"
+    # glove_path = data_set_path + "glove_embedding.csv"
+    # fasttext_path = data_set_path + "fasttext_embedding.csv"
 
-    glove_map = genfromtxt(glove_path, delimiter=',', skip_header=0)
-    fasttext_map = genfromtxt(fasttext_path, delimiter=',', skip_header=0)
+    # glove_map = genfromtxt(glove_path, delimiter=',', skip_header=0)
+    # fasttext_map = genfromtxt(fasttext_path, delimiter=',', skip_header=0)
 
     tfs = transforms.Compose([
         transforms.Resize((256, 256)),
@@ -313,21 +322,21 @@ def train():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=100,
+        batch_size=256,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     seen_loader = DataLoader(
         seen_ds,
-        batch_size=100,
+        batch_size=256,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     unseen_loader = DataLoader(
         unseen_ds,
-        batch_size=100,
+        batch_size=256,
         num_workers=23,
         shuffle=False,
         pin_memory=True
@@ -343,7 +352,7 @@ def train():
     opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_D = optim.Adam(net_D.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_cls = optim.Adam(net_cls.parameters(), lr=1e-3)
-    opt_F = torch.optim.SGD(net_F.parameters(), lr=0.01)
+    opt_F = optim.Adam(net_F.parameters(), lr=1e-3)
 
     loss_cls = nn.NLLLoss()
 
@@ -354,15 +363,11 @@ def train():
     lambda1 = 10
     for epoch in range(epochs):
         for iter, (image, label, attribute, feature) in enumerate(train_loader):
-            # real_feature = feature.to(device)
+            real_feature = feature.to(device)
             attribute = attribute.to(device)
             image = image.to(device)
             label = label.to(device)
             batch = feature.shape[0]
-
-            net_F.zero_grad()
-            real_feature = net_F(image)
-            print(real_feature.shape)
 
             for p in net_D.parameters():
                 p.requires_grad = True
@@ -370,6 +375,7 @@ def train():
             gp_sum = 0
             for _ in range(5):
                 net_D.zero_grad()
+                # real_feature = net_F(image)
                 input_resv = Variable(real_feature)
                 input_attv = Variable(attribute)
 
@@ -410,6 +416,8 @@ def train():
 
             net_E.zero_grad()
             net_G.zero_grad()
+            # net_F.zero_grad()
+            # real_feature = net_F(image)
             input_resv = Variable(real_feature)
             input_attv = Variable(attribute)
 
@@ -421,6 +429,9 @@ def train():
 
             fake = net_G(z, input_attv)
 
+            # print(fake.mean())
+            # print(input_resv.mean())
+
             vae_loss_seen = loss_fn(fake, input_resv, means, log_var)
 
             criticG_fake = net_D(fake, input_attv).mean()
@@ -430,7 +441,7 @@ def train():
             G_cost = -criticG_fake
             opt_G.step()
             opt_E.step()
-            opt_F.step()
+            # opt_F.step()
 
         print("Epoch: %d/%d, G loss: %.4f, D loss: %.4f, VEA loss: %.4f, Wasserstein_D: %.4f" % (
                     epoch, epochs, G_cost.item(), D_cost.item(), vae_loss_seen.item(), Wasserstein_D
@@ -438,6 +449,7 @@ def train():
         )
 
         net_G.eval()
+        net_F.eval()
         # train classifier
         res = build_data()
         unseenclasses = np.unique(res['test_unseen_label'])
@@ -459,9 +471,9 @@ def train():
         opt_cls.step()
 
         with torch.no_grad():
-            train_acc = cal_accuracy(net_cls, train_loader, device)
-            seen_acc = cal_accuracy(net_cls, seen_loader, device)
-            unseen_acc = cal_accuracy(net_cls, unseen_loader, device)
+            train_acc = cal_accuracy(net_cls, net_F, train_loader, device)
+            seen_acc = cal_accuracy(net_cls, net_F, seen_loader, device)
+            unseen_acc = cal_accuracy(net_cls, net_F, unseen_loader, device)
         H = 2*seen_acc*unseen_acc / (seen_acc+unseen_acc)
         if best_gzsl_acc < H:
             best_acc_seen, best_acc_unseen, best_gzsl_acc = seen_acc, unseen_acc, H

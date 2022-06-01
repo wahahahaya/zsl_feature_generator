@@ -1,7 +1,11 @@
+"""
+minmax the attribute [0,1]
+"""
+
 from scipy import io
 from os.path import join
 import numpy as np
-from numpy import genfromtxt, real
+from numpy import genfromtxt
 from PIL import Image
 from sklearn.metrics import accuracy_score
 from sklearn import preprocessing
@@ -40,9 +44,12 @@ def build_data():
     image_label = mat_content['labels'].astype(int).squeeze() - 1
     feature = mat_content['features'].T
 
+    scaler = preprocessing.MinMaxScaler()
+
     # att_splits.mat
     mat_content = io.loadmat(mat_root + "/" + data_name + "/" + class_embedding + ".mat")
     attribute = mat_content["att"].T
+    attribute = scaler.fit_transform(attribute)
 
     test_seen_loc = mat_content['test_seen_loc'].squeeze() - 1
     test_unseen_loc = mat_content['test_unseen_loc'].squeeze() - 1
@@ -56,20 +63,20 @@ def build_data():
 
     train_img = image_files[trainval_loc]
     train_feature = torch.from_numpy(_train_feature).float()
-    mx = train_feature.max()
-    train_feature.mul_(1/mx)
+    # mx = train_feature.max()
+    # train_feature.mul_(1/mx)
     train_label = image_label[trainval_loc].astype(int)
     train_att = torch.from_numpy(attribute[train_label]).float()
 
     test_image_unseen = image_files[test_unseen_loc]
     test_unseen_feature = torch.from_numpy(_test_unseen_feature).float()
-    test_unseen_feature.mul_(1/mx)
+    # test_unseen_feature.mul_(1/mx)
     test_label_unseen = image_label[test_unseen_loc].astype(int)
     test_unseen_att = torch.from_numpy(attribute[test_label_unseen]).float()
 
     test_image_seen = image_files[test_seen_loc]
     test_seen_feature = torch.from_numpy(_test_seen_feature).float()
-    test_seen_feature.mul_(1/mx)
+    # test_seen_feature.mul_(1/mx)
     test_label_seen = image_label[test_seen_loc].astype(int)
     test_seen_att = torch.from_numpy(attribute[test_label_seen]).float()
 
@@ -126,18 +133,6 @@ def weights_init(m):
         m.bias.data.fill_(0)
 
 
-class PyTMinMaxScalerVectorized(object):
-    """
-    Transforms each channel to the range [0, 1].
-    """
-    def __call__(self, tensor):
-        dist = (tensor.max(dim=1, keepdim=True)[0] - tensor.min(dim=1, keepdim=True)[0])
-        dist[dist == 0.] = 1.
-        scale = 1.0 / dist
-        tensor.mul_(scale).sub_(tensor.min(dim=1, keepdim=True)[0])
-        return tensor
-
-
 class Res101(nn.Module):
     def __init__(self):
         super(Res101, self).__init__()
@@ -146,12 +141,12 @@ class Res101(nn.Module):
         modules = list(res101.children())[:-1]
 
         self.resnet = nn.Sequential(*modules)
-        self.scaler = PyTMinMaxScalerVectorized()
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         # out.shape == (B, 2048, W, H)
         out = self.resnet(x).squeeze()
-        out = self.scaler(out)
+        out = self.sigmoid(out)
 
         return out
 
@@ -227,9 +222,9 @@ def cal_accuracy(classifier, feature_net, data_loader, device):
 
     for iteration, (img, label, attribute, feature) in enumerate(data_loader):
         img = img.to(device)
-        feature = feature_net(img)
+        # feature = feature_net(img)
         # feature.shape == (B, 300)
-        # feature = feature.to(device)
+        feature = feature.to(device)
         score = classifier(feature)
         scores.append(score)
         labels.append(label)
@@ -297,6 +292,8 @@ def compute_gradient_penalty(D, real_data, fake_data, attribute, device, lambda1
 
 
 def loss_fn(recon_x, x, mean, log_var):
+    # recon_x == fake
+    # x == real
     BCE = torch.nn.functional.binary_cross_entropy(recon_x+1e-12, x.detach(), reduction='none')
     BCE = BCE.sum() / x.size(0)
     KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp()) / x.size(0)
@@ -328,21 +325,21 @@ def train():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=32,
+        batch_size=256,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     seen_loader = DataLoader(
         seen_ds,
-        batch_size=64,
+        batch_size=256,
         num_workers=23,
         shuffle=False,
         pin_memory=True
     )
     unseen_loader = DataLoader(
         unseen_ds,
-        batch_size=64,
+        batch_size=256,
         num_workers=23,
         shuffle=False,
         pin_memory=True
@@ -358,7 +355,6 @@ def train():
     opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_D = optim.Adam(net_D.parameters(), lr=1e-3, betas=(0.5, 0.999))
     opt_cls = optim.Adam(net_cls.parameters(), lr=1e-3)
-    # opt_F = optim.Adam(net_F.parameters(), lr=1e-3)
 
     loss_cls = nn.NLLLoss()
 
@@ -367,21 +363,13 @@ def train():
     one = torch.tensor(1, dtype=torch.float).to(device)
     mone = (-1*one).to(device)
     lambda1 = 10
-    net_F.eval()
-    res = build_data()
     for epoch in range(epochs):
-        train_feature = np.zeros((1, 2048))
         for iter, (image, label, attribute, feature) in enumerate(train_loader):
-            # real_feature = feature.to(device)
+            real_feature = feature.to(device)
             attribute = attribute.to(device)
             image = image.to(device)
             label = label.to(device)
             batch = feature.shape[0]
-
-            # real_feature.shape == (B, 2048)
-            real_feature = net_F(image)
-
-            train_feature = np.vstack((train_feature, real_feature.cpu().detach().numpy()))
 
             for p in net_D.parameters():
                 p.requires_grad = True
@@ -443,6 +431,9 @@ def train():
 
             fake = net_G(z, input_attv)
 
+            # print(fake.mean())
+            # print(input_resv.mean())
+
             vae_loss_seen = loss_fn(fake, input_resv, means, log_var)
 
             criticG_fake = net_D(fake, input_attv).mean()
@@ -453,18 +444,21 @@ def train():
             opt_G.step()
             opt_E.step()
             # opt_F.step()
+
         print("Epoch: %d/%d, G loss: %.4f, D loss: %.4f, VEA loss: %.4f, Wasserstein_D: %.4f" % (
                     epoch, epochs, G_cost.item(), D_cost.item(), vae_loss_seen.item(), Wasserstein_D
             ), end=" "
         )
+
         net_G.eval()
+        net_F.eval()
         # train classifier
+        res = build_data()
         unseenclasses = np.unique(res['test_unseen_label'])
         # unseenattribute.shape == (200, 312); 200: all classes, 312: all attrubutes
         all_attribute = res['all_attribute']
         # train_feature.shape == (7057, 2048)
-        # train_label == (7057)
-        train_feature = torch.from_numpy(train_feature[1:]).float().to(device)
+        train_feature = res['train_feature'].to(device)
         train_label = torch.from_numpy(res['train_label']).to(device)
         # syn_feature.shape == (5000, 2048)
         # syn_label.shape == (5000)
@@ -474,7 +468,7 @@ def train():
 
         pred_out = net_cls(train_X)
         loss_classifier = loss_cls(pred_out, train_Y)
-        net_cls.zero_grad()
+        opt_cls.zero_grad()
         loss_classifier.backward()
         opt_cls.step()
 

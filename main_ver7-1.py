@@ -1,3 +1,7 @@
+"""
+let the feature extract model output different shape 2048 and 300
+"""
+
 from scipy import io
 from os.path import join
 import numpy as np
@@ -139,28 +143,42 @@ class PyTMinMaxScalerVectorized(object):
 
 
 class Res101(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Res101, self).__init__()
 
         res101 = models.resnet101(pretrained=True)
-        modules = list(res101.children())[:-1]
+        self.feature_shape = feature_shape
+        if self.feature_shape == 2048:
+            modules = list(res101.children())[:-1]
+        elif self.feature_shape == 300:
+            modules = list(res101.children())[:-2]
 
         self.resnet = nn.Sequential(*modules)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.conv = nn.Conv2d(2048, 300, 1, 1)
         self.scaler = PyTMinMaxScalerVectorized()
 
     def forward(self, x):
-        # out.shape == (B, 2048, W, H)
-        out = self.resnet(x).squeeze()
-        out = self.scaler(out)
+        if self.feature_shape == 2048:
+            feature_vector = self.resnet(x).squeeze()
+        elif self.feature_shape == 300:
+            # feature_map.shape == (B, 2048, 8, 8)
+            feature_map = self.resnet(x)
+            # feature_map.shape == (B, 300, 8, 8)
+            feature_map = self.conv(feature_map)
+            # feature_vector.shape == (B, 300)
+            feature_vector = self.avgpool(feature_map).squeeze()
+
+        out = self.scaler(feature_vector)
 
         return out
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Encoder, self).__init__()
 
-        self.fc1 = nn.Linear(2360, 1024)
+        self.fc1 = nn.Linear(feature_shape+312, 1024)
         self.fc3 = nn.Linear(1024, 600)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.linear_means = nn.Linear(600, 300)
@@ -177,10 +195,10 @@ class Encoder(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Generator, self).__init__()
         self.fc1 = nn.Linear(612, 1024)
-        self.fc2 = nn.Linear(1024, 2048)
+        self.fc2 = nn.Linear(1024, feature_shape)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.sigmoid = nn.Sigmoid()
         self.apply(weights_init)
@@ -193,9 +211,9 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_shape):
         super(Discriminator, self).__init__()
-        self.fc1 = nn.Linear(2048 + 312, 1024)
+        self.fc1 = nn.Linear(feature_shape+312, 1024)
         self.fc2 = nn.Linear(1024, 1)
         self.lrelu = nn.LeakyReLU(0.2, True)
         self.apply(weights_init)
@@ -210,7 +228,7 @@ class Discriminator(nn.Module):
 class classifier(nn.Module):
     def __init__(self, input_dim, nclass):
         super(classifier, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 200)
+        self.fc1 = nn.Linear(input_dim, nclass)
 
         self.logic = nn.LogSoftmax(dim=1)
 
@@ -253,9 +271,9 @@ def cal_accuracy(classifier, feature_net, data_loader, device):
     return acc
 
 
-def generate_syn_feature(generator, classes, attribute, num, device):
+def generate_syn_feature(generator, classes, attribute, feature_shape, num, device):
     nclass = classes.shape[0]
-    syn_feature = torch.FloatTensor(nclass*num, 2048).to(device)
+    syn_feature = torch.FloatTensor(nclass*num, feature_shape).to(device)
     syn_label = torch.LongTensor(nclass*num).to(device)
     syn_att = torch.FloatTensor(num, 312).to(device)
     syn_att.requires_grad_(False)
@@ -306,7 +324,8 @@ def loss_fn(recon_x, x, mean, log_var):
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs = 500
-
+    feature_shape = 300
+    print(feature_shape)
     # # load attribute map
     # data_set_path = '../../dataset/'
 
@@ -348,11 +367,11 @@ def train():
         pin_memory=True
     )
 
-    net_E = Encoder().to(device)
-    net_G = Generator().to(device)
-    net_D = Discriminator().to(device)
-    net_cls = classifier(2048, 200).to(device)
-    net_F = Res101().to(device)
+    net_E = Encoder(feature_shape).to(device)
+    net_G = Generator(feature_shape).to(device)
+    net_D = Discriminator(feature_shape).to(device)
+    net_cls = classifier(feature_shape, 200).to(device)
+    net_F = Res101(feature_shape).to(device)
 
     opt_E = optim.Adam(net_E.parameters(), lr=1e-3)
     opt_G = optim.Adam(net_G.parameters(), lr=1e-3, betas=(0.5, 0.999))
@@ -370,7 +389,7 @@ def train():
     net_F.eval()
     res = build_data()
     for epoch in range(epochs):
-        train_feature = np.zeros((1, 2048))
+        train_feature = np.zeros((1, feature_shape))
         for iter, (image, label, attribute, feature) in enumerate(train_loader):
             # real_feature = feature.to(device)
             attribute = attribute.to(device)
@@ -468,7 +487,7 @@ def train():
         train_label = torch.from_numpy(res['train_label']).to(device)
         # syn_feature.shape == (5000, 2048)
         # syn_label.shape == (5000)
-        syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, all_attribute, 100, device)
+        syn_feature, syn_label = generate_syn_feature(net_G, unseenclasses, all_attribute, feature_shape, 100, device)
         train_X = torch.cat((train_feature, syn_feature), 0)
         train_Y = torch.cat((train_label, syn_label), 0)
 
