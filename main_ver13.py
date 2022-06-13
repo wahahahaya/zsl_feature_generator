@@ -158,7 +158,7 @@ def cal_accuracy(net_cls, model, data_loader, device):
 
         image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
-        similarity = (image_features @ text_features.T).softmax(dim=-1)
+        similarity = (image_features @ text_features.T).softmax(dim=-1).float()
 
         score = net_cls(similarity)
         scores.append(score)
