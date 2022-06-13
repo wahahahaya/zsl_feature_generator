@@ -412,8 +412,6 @@ def train():
 
     best_gzsl_acc = 0
     best_train_acc = 0
-    one = torch.tensor(1, dtype=torch.float).to(device)
-    mone = (-1*one).to(device)
     lambda1 = 10
     for epoch in range(epochs):
         for iter, (image, label, attribute, feature) in tqdm(list(enumerate(train_loader))):
